@@ -1,9 +1,19 @@
-"""macOS mount-cycle lab; no production volume guard or recovery implementation."""
+"""macOS/Linux mount-cycle lab; no production volume guard or recovery implementation.
+
+On Darwin the lab creates real sparse disk images and attaches them with
+hdiutil. On Linux it bind-mounts per-volume image directories with the system
+mount/umount tools, which requires mount privileges (root or CAP_SYS_ADMIN);
+where the kernel refuses, commands fail and the caller must record the volume
+experiments as not executed instead of simulating them.
+"""
 import argparse
 import json
 from pathlib import Path
 import plistlib
 import subprocess
+import sys
+
+DARWIN = sys.platform == "darwin"
 
 
 def invoke(argv):
@@ -40,7 +50,32 @@ def detach(state, force=False):
     state["mounted"] = None
 
 
+def linux_attach(image, mount):
+    mount.mkdir(parents=True, exist_ok=True)
+    if any(mount.iterdir()):
+        raise ValueError("MOUNTPOINT_NOT_EMPTY")
+    invoke(["mount", "--bind", str(image), str(mount)])
+    return str(image)
+
+
+def linux_detach(state, force=False):
+    if state["device"] is None:
+        return
+    argv = ["umount"]
+    if force:
+        # Lazy detach tolerates descriptors pinned by open workers, matching
+        # hdiutil detach -force semantics for the disconnect experiments.
+        argv.append("-l")
+    invoke(argv + [state["mount"]])
+    state["device"] = None
+    state["mounted"] = None
+
+
 def open_lab(area):
+    return open_lab_darwin(area) if DARWIN else open_lab_linux(area)
+
+
+def open_lab_darwin(area):
     area = Path(area).resolve()
     area.mkdir(parents=True, exist_ok=False)
     mount = area / "载荷挂载点"
@@ -69,15 +104,49 @@ def open_lab(area):
         raise
 
 
+def open_lab_linux(area):
+    area = Path(area).resolve()
+    area.mkdir(parents=True, exist_ok=False)
+    mount = area / "载荷挂载点"
+    mount.mkdir()
+    state = {"mount": str(mount), "payload": str(mount / "payload"),
+             "device": None, "mounted": None, "images": {}, "uuids": {},
+             "backend": "linux-bind"}
+    try:
+        for name in ("original", "foreign"):
+            image = area / "images" / name
+            (image / "payload").mkdir(parents=True)
+            state["images"][name] = str(image)
+            state["device"] = linux_attach(image, mount)
+            state["mounted"] = name
+            from volguard import mounted_identity
+            state["uuids"][name] = mounted_identity(str(mount))
+            linux_detach(state)
+        assert state["uuids"]["original"] != state["uuids"]["foreign"]
+        state["device"] = linux_attach(Path(state["images"]["original"]), mount)
+        state["mounted"] = "original"
+        save(area, state)
+        return state
+    except BaseException:
+        try:
+            linux_detach(state, force=True)
+        except Exception:
+            pass
+        raise
+
+
 def cycle(command, area, which=None):
     area, state = load(area)
+    linux = state.get("backend") == "linux-bind"
+    do_attach = linux_attach if linux else attach
+    do_detach = linux_detach if linux else detach
     if command == "mount":
         if state["mounted"] is not None:
             raise ValueError("DETACH_FIRST")
-        state["device"] = attach(Path(state["images"][which]), Path(state["mount"]))
+        state["device"] = do_attach(Path(state["images"][which]), Path(state["mount"]))
         state["mounted"] = which
     else:
-        detach(state, force=command == "offline")
+        do_detach(state, force=command == "offline")
     save(area, state)
     return state
 

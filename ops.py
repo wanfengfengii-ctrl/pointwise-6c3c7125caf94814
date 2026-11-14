@@ -1,4 +1,4 @@
-"""Existing build/install/worker entry point. Payload relocation is not implemented."""
+"""Build/install/worker entry point with external payload volume binding."""
 import argparse
 import hashlib
 import io
@@ -13,8 +13,9 @@ import time
 import zipfile
 from pipeline import Engine, connect
 from localio import Gate, LocalBlobs, worker
+from volguard import ExternalBlobs, VolumeError, bind, load_binding
 
-CORE = ("ops.py", "pipeline.py", "localio.py")
+CORE = ("ops.py", "pipeline.py", "localio.py", "volguard.py")
 
 
 def bundle(source):
@@ -52,7 +53,7 @@ def build(out):
     return {"package": str(out)}
 
 
-def install(package, dest, python, no_load=False):
+def install(package, dest, python, no_load=False, payload_dir=None):
     package, dest = Path(package).resolve(), Path(dest).resolve()
     interpreter = Path(python)
     if not interpreter.is_absolute() or not interpreter.is_file() or not os.access(str(interpreter), os.X_OK):
@@ -65,6 +66,8 @@ def install(package, dest, python, no_load=False):
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         if archive.testzip() is not None or not set(CORE + ("__main__.py",)).issubset(archive.namelist()):
             raise ValueError("PACKAGE_CONTENT")
+    # Bind the external payload volume before touching anything on disk.
+    binding = bind(payload_dir) if payload_dir is not None else None
     app, root = dest / "app.pyz", dest / "data"
     label = "org.pointwise.lake." + hashlib.sha256(str(dest).encode()).hexdigest()[:16]
     config = {"Label": label, "ProgramArguments": [str(interpreter), str(app), "run", str(root)],
@@ -75,6 +78,9 @@ def install(package, dest, python, no_load=False):
     # Every package check precedes any modification to the installation.
     root.mkdir(parents=True, exist_ok=True)
     atomic(app, data)
+    if binding is not None:
+        atomic(root / "volume.json",
+               json.dumps(binding, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     plist = dest / "launch-agent.plist"
     atomic(plist, plist_data)
     if not no_load:
@@ -90,7 +96,11 @@ def job(command, root, input_path=None, once=False):
     hook = Gate()
     db = connect(root / "state.sqlite")
     try:
-        engine = Engine(db, LocalBlobs(root, hook), hook)
+        binding = load_binding(root)
+        # External mode never constructs LocalBlobs, so no substitute payload
+        # directory appears on the internal volume.
+        blobs = ExternalBlobs(binding, hook) if binding is not None else LocalBlobs(root, hook)
+        engine = Engine(db, blobs, hook)
         if command == "submit":
             with open(input_path, encoding="utf-8") as stream:
                 return engine.accept(json.load(stream))
@@ -98,14 +108,33 @@ def job(command, root, input_path=None, once=False):
             return engine.read()
         if command == "status":
             result = engine.status()
-            result["inventory"] = engine.blobs.inventory()
+            result["inventory"] = blobs.inventory()
+            if binding is not None:
+                result["volume_state"] = blobs.state()
             return result
         with worker(root):
             if once:
+                if binding is not None:
+                    blobs.require_ready()
                 return {"progressed": engine.step()}
+            announced = None
             while True:
-                if not engine.step():
-                    time.sleep(0.1)
+                try:
+                    if binding is not None:
+                        blobs.require_ready()
+                    progressed = engine.step()
+                    announced = None
+                except VolumeError as exc:
+                    # Controlled wait: the resident worker survives volume
+                    # loss and resumes by itself once the original volume is
+                    # reattached at the agreed location.
+                    if announced != str(exc):
+                        print(str(exc), file=sys.stderr, flush=True)
+                        announced = str(exc)
+                    time.sleep(1)
+                    continue
+                if not progressed:
+                    time.sleep(0.5 if binding is not None else 0.1)
     finally:
         db.close()
 
@@ -120,6 +149,7 @@ def main():
     p.add_argument("dest")
     p.add_argument("--python", required=True)
     p.add_argument("--no-load", action="store_true")
+    p.add_argument("--payload-dir", default=None)
     for name in ("submit", "read", "status", "run"):
         p = commands.add_parser(name)
         p.add_argument("root")
@@ -132,7 +162,7 @@ def main():
         if args.command == "build":
             result = build(args.out)
         elif args.command == "install":
-            result = install(args.package, args.dest, args.python, args.no_load)
+            result = install(args.package, args.dest, args.python, args.no_load, args.payload_dir)
         else:
             result = job(args.command, args.root, getattr(args, "input", None), getattr(args, "once", False))
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
